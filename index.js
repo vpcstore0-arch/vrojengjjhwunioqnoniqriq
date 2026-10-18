@@ -9,13 +9,36 @@ const BOT_TOKEN    = process.env.BOT_TOKEN    || '';
 const CHAT_IDS     = (process.env.CHAT_IDS    || '').split(',').map(s => s.trim()).filter(Boolean);
 const CRON_SECRET  = process.env.CRON_SECRET  || '';
 
-const API_URL   = 'https://recargapro.gt.tc/api_recargas_x7k2.php?limit=100&order=desc';
-const STATUS_OK = ['pendente', 'andamento', 'feita'];
+// Chave da API no header + query (redundância caso hospedagem filtre a query)
+const API_KEY  = '87443981';
+const API_BASE = 'https://recargapro.gt.tc/api_recargas_x7k2.php';
+const API_URL  = `${API_BASE}?api_key=${API_KEY}&limit=100&order=desc`;
+
+const STATUS_OK  = ['pendente', 'andamento', 'feita'];
 const STATE_FILE = '/tmp/bot_state.txt';
 
 // ================== LOG ==================
 function log(msg) {
     console.log(`[${new Date().toISOString()}] ${msg}`);
+}
+
+// ================== EXTRAI JSON DO MEIO DO TEXTO ==================
+function extractJson(text) {
+    if (!text || typeof text !== 'string') return null;
+
+    // Tenta direto
+    try { return JSON.parse(text); } catch (e) {}
+
+    // Se tem HTML antes do JSON, extrai do primeiro { até o último }
+    const first = text.indexOf('{');
+    const last  = text.lastIndexOf('}');
+    if (first !== -1 && last > first) {
+        const candidate = text.substring(first, last + 1);
+        try {
+            return JSON.parse(candidate);
+        } catch (e) {}
+    }
+    return null;
 }
 
 // ================== FETCH COM PUPPETEER ==================
@@ -35,20 +58,32 @@ async function fetchWithPuppeteer(url) {
         });
 
         const page = await browser.newPage();
+
+        // 1) User-Agent de navegador real
         await page.setUserAgent(
             'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
         );
+
+        // 2) Envia a chave via HEADER (redundância caso a query seja filtrada)
+        await page.setExtraHTTPHeaders({
+            'Authorization': `Bearer ${API_KEY}`,
+            'X-API-Key':     API_KEY,
+        });
 
         log('Navegando para API...');
         await page.goto(url, { waitUntil: 'networkidle0', timeout: 30000 });
 
         // Aguarda o desafio AES ser resolvido
-        await new Promise(r => setTimeout(r, 2000));
+        await new Promise(r => setTimeout(r, 2500));
 
-        const body = await page.evaluate(() => document.body.innerText.trim());
-        log('Resposta: ' + body.substring(0, 80) + (body.length > 80 ? '...' : ''));
+        const bodyText = await page.evaluate(() => document.body.innerText.trim());
+        log('Resposta bruta (200 chars): ' + bodyText.substring(0, 200).replace(/\n/g, ' '));
 
-        return JSON.parse(body);
+        const json = extractJson(bodyText);
+        if (!json) {
+            throw new Error('JSON não encontrado na resposta: ' + bodyText.substring(0, 100));
+        }
+        return json;
     } finally {
         if (browser) await browser.close();
     }
@@ -120,7 +155,7 @@ function setLastId(id) {
 async function verificarPedidos() {
     log('=== Verificando novos pedidos ===');
 
-    if (!BOT_TOKEN)      { log('ERRO: BOT_TOKEN ausente'); return; }
+    if (!BOT_TOKEN)            { log('ERRO: BOT_TOKEN ausente'); return; }
     if (CHAT_IDS.length === 0) { log('ERRO: CHAT_IDS ausente'); return; }
 
     let json;
@@ -207,7 +242,7 @@ const chatIdHandler = async (req, res) => {
 
         if (!data.ok) return res.send('Erro Telegram: ' + JSON.stringify(data));
         if (!data.result || data.result.length === 0) {
-            return res.send('Envie /start para o bot no Telegram e recarregue esta página.');
+            return res.send('Envie /start para o bot no Telegram e recarregue.');
         }
 
         const seen = new Set();
@@ -229,12 +264,12 @@ const chatIdHandler = async (req, res) => {
     }
 };
 
-app.get('/',                (req, res) => res.send('Bot RecargaPro — Online'));
-app.get('/health',          (req, res) => res.send('OK'));
-app.get('/ping',            checkHandler);
-app.get('/bot_telegram.php', checkHandler);   // mantém compatibilidade com URL antiga
-app.get('/chatid',          chatIdHandler);
-app.get('/get_chat_id.php', chatIdHandler);   // mantém compatibilidade
+app.get('/',                 (req, res) => res.send('Bot RecargaPro — Online'));
+app.get('/health',           (req, res) => res.send('OK'));
+app.get('/ping',             checkHandler);
+app.get('/bot_telegram.php', checkHandler);
+app.get('/chatid',           chatIdHandler);
+app.get('/get_chat_id.php',  chatIdHandler);
 
 // ================== START ==================
 const PORT = process.env.PORT || 3000;
