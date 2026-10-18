@@ -185,24 +185,18 @@ async function verificarPedidos() {
     log('=== Concluído ===');
 }
 
-// ================== UPDATE STATUS (chama a API PHP) ==================
+// ================== UPDATE STATUS (Puppeteer resolve o anti-bot) ==================
 async function atualizarStatus(id, status) {
     const url = `${API_UPDATE_BASE}?api_key=${API_KEY}&id=${id}&status=${status}&origem=bot`;
     log(`Atualizando #${id} → ${status}`);
     try {
-        const r = await fetch(url, {
-            headers: {
-                'Authorization': `Bearer ${API_KEY}`,
-                'X-API-Key': API_KEY,
-                'Accept': 'application/json',
-            },
-        });
-        const j = await r.json();
-        log('API update: ' + JSON.stringify(j).substring(0,200));
+        // Usa a MESMA função que lista pedidos — ela já resolve o AES
+        const j = await fetchWithPuppeteer(url);
+        log('API update: ' + JSON.stringify(j).substring(0, 200));
         return j;
-    } catch(e) {
-        log('Erro update: '+e.message);
-        return { success:false, error:{message:e.message} };
+    } catch (e) {
+        log('Erro update: ' + e.message);
+        return { success: false, error: { message: e.message } };
     }
 }
 
