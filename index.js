@@ -93,8 +93,7 @@ function formatOrder(o) {
          + `📱 <b>Telefone:</b> ${esc(o.telefone_formatado||o.telefone)}\n`
          + `📡 <b>Operadora:</b> ${(o.operadora||'').toUpperCase()}\n\n`
          + `💰 <b>Valor:</b> R$ ${val}\n`
-         + `💸 <b>Custo:</b> R$ ${cus}\n`
-         + `📈 <b>Lucro:</b> R$ ${luc}\n\n`
+         + `💸 <b>Custo:</b> R$ ${cus}\n\n`
          + `📊 <b>Status:</b> ${cap(o.status)}\n`
          + `🕐 <b>Data:</b> ${dtStr}`;
 }
