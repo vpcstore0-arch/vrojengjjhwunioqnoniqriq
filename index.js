@@ -6,23 +6,32 @@ const app = express();
 app.use(express.json());
 
 // ================== CONFIG ==================
-const BOT_TOKEN    = process.env.BOT_TOKEN    || '';
-const CHAT_IDS     = (process.env.CHAT_IDS    || '').split(',').map(s => s.trim()).filter(Boolean);
-const CRON_SECRET  = process.env.CRON_SECRET  || '';
+const BOT_TOKEN      = process.env.BOT_TOKEN    || '';
+const CHAT_IDS       = (process.env.CHAT_IDS    || '').split(',').map(s => s.trim()).filter(Boolean);
+const CRON_SECRET    = process.env.CRON_SECRET  || '';
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || 'whk_recarga_2026';
 
-const API_KEY         = '87443981';
-const API_BASE        = 'https://recargapro.gt.tc/api_recargas_x7k2.php';
-const API_URL         = `${API_BASE}?api_key=${API_KEY}&limit=100&order=desc`;
-const API_UPDATE_BASE = 'https://recargapro.gt.tc/api_atualizar_status.php';
+const API_KEY = '87443981';
 
-const STATUS_OK  = ['pendente', 'andamento', 'feita'];
-const STATE_FILE = '/tmp/bot_state.txt';
+const API_URL           = `https://recargapro.gt.tc/api_recargas_x7k2.php?api_key=${API_KEY}&limit=200&order=desc`;
+const API_PASSES_URL    = `https://recargapro.gt.tc/api_passes_x7k2.php?api_key=${API_KEY}&limit=200&order=desc`;
+const API_PAGAMENTOS_URL = `https://recargapro.gt.tc/api_pagamentos_x7k2.php?api_key=${API_KEY}&limit=200&order=desc`;
+
+// Status que valem notificação imediata (recargas/passes novos)
+const STATUS_OK = ['pendente', 'andamento', 'feita'];
+
+// Status de pagamento que representa "depósito confirmado"
+const STATUS_DEPOSITO_OK = 'approved';
+
+const STATE_FILE            = '/tmp/bot_state.txt';
+const STATE_FILE_PASSES     = '/tmp/bot_state_passes.txt';
+const STATE_FILE_PAGAMENTOS = '/tmp/bot_state_pagamentos.txt';
 
 // ================== LOG ==================
 function log(msg) { console.log(`[${new Date().toISOString()}] ${msg}`); }
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-// ================== JSON EXTRACT ==================
+// ================== HELPERS ==================
 function extractJson(text) {
     if (!text || typeof text !== 'string') return null;
     try { return JSON.parse(text); } catch (e) {}
@@ -31,6 +40,19 @@ function extractJson(text) {
         try { return JSON.parse(text.substring(a, b + 1)); } catch (e) {}
     }
     return null;
+}
+
+function esc(s) { return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function cap(s) { return s ? s.charAt(0).toUpperCase() + s.slice(1) : ''; }
+
+function fmtData(dtStr) {
+    try {
+        const dt = new Date(String(dtStr).replace(' ','T') + '-03:00');
+        return new Date(dt.getTime()+4*3600*1000).toLocaleString('pt-BR',{timeZone:'America/Fortaleza'});
+    } catch(e){ return '—'; }
+}
+function fmtMoeda(v) {
+    return Number(v||0).toFixed(2).replace('.', ',');
 }
 
 // ================== PUPPETEER ==================
@@ -48,11 +70,9 @@ async function fetchWithPuppeteer(url) {
             'Authorization': `Bearer ${API_KEY}`,
             'X-API-Key':     API_KEY,
         });
-        log('Navegando para API...');
         await page.goto(url, { waitUntil: 'networkidle0', timeout: 30000 });
-        await new Promise(r => setTimeout(r, 2500));
+        await sleep(2500);
         const bodyText = await page.evaluate(() => document.body.innerText.trim());
-        log('Resposta (200 chars): ' + bodyText.substring(0, 200).replace(/\n/g, ' '));
         const j = extractJson(bodyText);
         if (!j) throw new Error('JSON não encontrado: ' + bodyText.substring(0, 100));
         return j;
@@ -72,224 +92,306 @@ async function tg(method, payload) {
     return resp.json();
 }
 
-function esc(s) { return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
-function cap(s) { return s ? s.charAt(0).toUpperCase() + s.slice(1) : ''; }
+async function sendToAll(text) {
+    let ok = true;
+    for (const chatId of CHAT_IDS) {
+        try {
+            const r = await tg('sendMessage', {
+                chat_id: chatId,
+                text,
+                parse_mode: 'HTML',
+                disable_web_page_preview: true,
+            });
+            if (!r.ok) { log(`ERRO msg → ${chatId}: ${JSON.stringify(r).substring(0,150)}`); ok = false; }
+            await sleep(300);
+        } catch(e){ log(`ERRO msg: ${e.message}`); ok = false; }
+    }
+    return ok;
+}
 
-function formatOrder(o) {
-    const emoji = { pendente:'⏳', andamento:'🔄', feita:'✅' }[o.status] || '📦';
-    const val = Number(o.valor||0).toFixed(2).replace('.',',');
-    const cus = Number(o.custo||0).toFixed(2).replace('.',',');
-    const luc = (Number(o.valor||0)-Number(o.custo||0)).toFixed(2).replace('.',',');
-
-    let dtStr = '—';
-    try {
-        const dt = new Date(o.criado_em.replace(' ','T') + '-03:00');
-        dtStr = new Date(dt.getTime()+4*3600*1000).toLocaleString('pt-BR',{timeZone:'America/Fortaleza'});
-    } catch(e){}
-
-    return `${emoji} <b>Novo Pedido #${o.id}</b>\n\n`
+// ================== FORMAT RECARGAS ==================
+function formatOrderNew(o) {
+    return `🎮 <b>Novo Pedido #${o.id}</b>\n\n`
          + `👤 <b>Revendedor:</b> ${esc(o.revendedor?.nome||'N/A')}\n`
          + `📧 <b>Email:</b> ${esc(o.revendedor?.email||'N/A')}\n`
          + `📱 <b>Telefone:</b> ${esc(o.telefone_formatado||o.telefone)}\n`
          + `📡 <b>Operadora:</b> ${(o.operadora||'').toUpperCase()}\n\n`
-         + `💰 <b>Valor:</b> R$ ${val}\n`
-         + `💸 <b>Custo:</b> R$ ${cus}\n\n`
+         + `💰 <b>Valor:</b> R$ ${fmtMoeda(o.valor)}\n`
+         + `💸 <b>Custo:</b> R$ ${fmtMoeda(o.custo)}\n\n`
          + `📊 <b>Status:</b> ${cap(o.status)}\n`
-         + `🕐 <b>Data:</b> ${dtStr}`;
+         + `🕐 <b>Data:</b> ${fmtData(o.criado_em)}`;
 }
 
-function inlineKeyboard(orderId, currentStatus) {
-    const btn = (label, status) => ({
-        text: label,
-        callback_data: `st:${orderId}:${status}`,
-    });
-    // Agrupa em 2 linhas
-    return {
-        inline_keyboard: [
-            [ btn('⏳ Pendente', 'pendente'), btn('🔄 Andamento', 'andamento'), btn('✅ Feita', 'feita') ],
-            [ btn('❌ Cancelar', 'cancelada'), btn('⌛ Expirada', 'expirada') ],
-        ],
-    };
+function formatOrderChanged(o, anterior) {
+    return `🔄 <b>Pedido #${o.id}</b> — status alterado\n\n`
+         + `👤 <b>Revendedor:</b> ${esc(o.revendedor?.nome||'N/A')}\n`
+         + `📱 <b>Telefone:</b> ${esc(o.telefone_formatado||o.telefone)}\n`
+         + `📡 <b>Operadora:</b> ${(o.operadora||'').toUpperCase()}\n\n`
+         + `📊 <b>Status:</b> ${cap(anterior)} → <b>${cap(o.status).toUpperCase()}</b>\n`
+         + `💰 <b>Valor:</b> R$ ${fmtMoeda(o.valor)}\n`
+         + `🕐 <b>Atualizado:</b> ${fmtData(o.atualizado_em || new Date().toISOString())}`;
+}
+
+// ================== FORMAT PASSES ==================
+function formatPasseNew(p) {
+    return `🎟️ <b>Novo Passe FF #${p.id}</b>\n\n`
+         + `👤 <b>Revendedor:</b> ${esc(p.revendedor?.nome||'N/A')}\n`
+         + `📧 <b>Email:</b> ${esc(p.revendedor?.email||'N/A')}\n`
+         + `🎮 <b>Player ID:</b> <code>${esc(p.player_id)}</code>\n`
+         + `🏷️ <b>Nick:</b> ${esc(p.nick)}\n\n`
+         + `💰 <b>Valor:</b> R$ ${fmtMoeda(p.valor)}\n`
+         + `💸 <b>Custo:</b> R$ ${fmtMoeda(p.custo)}\n\n`
+         + `📊 <b>Status:</b> ${cap(p.status)}\n`
+         + `🕐 <b>Data:</b> ${fmtData(p.criado_em)}`;
+}
+
+function formatPasseChanged(p, anterior) {
+    return `🔄 <b>Passe FF #${p.id}</b> — status alterado\n\n`
+         + `👤 <b>Revendedor:</b> ${esc(p.revendedor?.nome||'N/A')}\n`
+         + `🎮 <b>Player ID:</b> <code>${esc(p.player_id)}</code>\n`
+         + `🏷️ <b>Nick:</b> ${esc(p.nick)}\n\n`
+         + `📊 <b>Status:</b> ${cap(anterior)} → <b>${cap(p.status).toUpperCase()}</b>\n`
+         + `💰 <b>Valor:</b> R$ ${fmtMoeda(p.valor)}\n`
+         + `🕐 <b>Atualizado:</b> ${fmtData(p.atualizado_em || new Date().toISOString())}`;
+}
+
+// ================== FORMAT DEPÓSITOS ==================
+function formatDeposito(p, anterior) {
+    const novo = !anterior;
+    const titulo = novo
+        ? `💰 <b>Novo Depósito #${p.id}</b>`
+        : `💰 <b>Depósito Aprovado #${p.id}</b>`;
+
+    const statusLine = novo
+        ? `📊 <b>Status:</b> <b>Approved</b>`
+        : `📊 <b>Status:</b> ${cap(anterior)} → <b>Approved</b>`;
+
+    return `${titulo}\n\n`
+         + `👤 <b>Revendedor:</b> ${esc(p.revendedor?.nome||'N/A')}\n`
+         + `📧 <b>Email:</b> ${esc(p.revendedor?.email||'N/A')}\n`
+         + `💳 <b>Valor:</b> R$ ${fmtMoeda(p.valor)}\n`
+         + (p.mp_payment_id ? `🆔 <b>MP ID:</b> <code>${esc(p.mp_payment_id)}</code>\n` : '')
+         + `\n${statusLine}\n`
+         + `🕐 <b>Data:</b> ${fmtData(p.atualizado_em || p.criado_em || new Date().toISOString())}`;
 }
 
 // ================== STATE ==================
-function getLastId() {
+// Formato: { lastId: número, statuses: { "123": "pendente", "124": "feita" } }
+function loadState(file) {
     try {
-        if (fs.existsSync(STATE_FILE)) {
-            const v = fs.readFileSync(STATE_FILE, 'utf8').trim();
-            return v === '' ? null : parseInt(v, 10);
-        }
-    } catch(e){ log('Erro state: '+e.message); }
+        if (!fs.existsSync(file)) return null;
+        const raw = fs.readFileSync(file, 'utf8').trim();
+        if (!raw) return null;
+        if (/^\d+$/.test(raw)) return { lastId: parseInt(raw, 10), statuses: {} };
+        const j = JSON.parse(raw);
+        if (typeof j.lastId === 'number' && j.statuses && typeof j.statuses === 'object') return j;
+    } catch(e){ log('Erro load state '+file+': '+e.message); }
     return null;
 }
-function setLastId(id) {
-    try { fs.writeFileSync(STATE_FILE, String(id)); } catch(e){ log('Erro state: '+e.message); }
+
+function saveState(file, state) {
+    try { fs.writeFileSync(file, JSON.stringify(state)); } catch(e){ log('Erro save state '+file+': '+e.message); }
 }
 
-// ================== VERIFICAÇÃO ==================
-async function verificarPedidos() {
-    log('=== Verificando novos pedidos ===');
+function buildStatuses(items, statusField) {
+    const s = {};
+    for (const it of items) s[it.id] = it[statusField || 'status'];
+    return s;
+}
+
+// ================== VERIFICAÇÃO GENÉRICA (recargas/passes) ==================
+async function verificarLista({ label, url, stateFile, formatNew, formatChanged }) {
+    log(`=== Verificando ${label} ===`);
     if (!BOT_TOKEN)            { log('ERRO: BOT_TOKEN ausente'); return; }
     if (CHAT_IDS.length === 0) { log('ERRO: CHAT_IDS ausente'); return; }
 
     let json;
-    try { json = await fetchWithPuppeteer(API_URL); }
-    catch (e) { log('ERRO no fetch: '+e.message); return; }
+    try { json = await fetchWithPuppeteer(url); }
+    catch (e) { log(`ERRO fetch ${label}: ` + e.message); return; }
 
     if (!json.success || !Array.isArray(json.data)) {
-        log('ERRO: resposta inválida — '+JSON.stringify(json).substring(0,200));
+        log(`ERRO resposta ${label}: ` + JSON.stringify(json).substring(0,200));
         return;
     }
-    const pedidos = json.data;
-    if (pedidos.length === 0) { log('API vazia'); return; }
+    const items = json.data;
+    if (items.length === 0) { log(`API ${label} vazia`); return; }
 
-    const maxId = Math.max(...pedidos.map(p => parseInt(p.id,10)));
-    log(`Total: ${pedidos.length} | Maior ID: ${maxId}`);
+    const maxId = Math.max(...items.map(it => parseInt(it.id, 10)));
 
-    const lastId = getLastId();
-    if (lastId === null) {
-        setLastId(maxId);
-        log(`Primeira execução: maxId=${maxId} salvo. Não notifica.`);
+    const state = loadState(stateFile);
+    if (!state) {
+        saveState(stateFile, { lastId: maxId, statuses: buildStatuses(items) });
+        log(`${label} — primeira execução: maxId=${maxId} salvo. Não notifica.`);
         return;
     }
 
-    const novos = pedidos
-        .filter(p => parseInt(p.id,10) > lastId && STATUS_OK.includes(p.status))
-        .sort((a,b) => parseInt(a.id,10) - parseInt(b.id,10));
+    const novos     = [];
+    const alterados = [];
 
-    log(`Último ID visto: ${lastId} | Novos: ${novos.length}`);
-    if (novos.length === 0) { log('Nada a notificar'); return; }
-
-    for (const p of novos) {
-        const msg = formatOrder(p);
-        const kb  = inlineKeyboard(p.id, p.status);
-        let ok = true;
-
-        for (const chatId of CHAT_IDS) {
-            try {
-                const r = await tg('sendMessage', {
-                    chat_id: chatId,
-                    text: msg,
-                    parse_mode: 'HTML',
-                    disable_web_page_preview: true,
-                    reply_markup: kb,
-                });
-                if (!r.ok) { log(`ERRO #${p.id} → ${chatId}: ${JSON.stringify(r).substring(0,150)}`); ok=false; }
-                else       log(`✓ Pedido #${p.id} enviado para ${chatId}`);
-                await new Promise(r => setTimeout(r, 300));
-            } catch(e){ log(`ERRO #${p.id}: ${e.message}`); ok=false; }
+    for (const it of items) {
+        const id = parseInt(it.id, 10);
+        if (id > state.lastId) {
+            if (STATUS_OK.includes(it.status)) novos.push(it);
+        } else if (state.statuses[id] && state.statuses[id] !== it.status) {
+            alterados.push({ item: it, anterior: state.statuses[id] });
         }
-        if (ok) setLastId(parseInt(p.id,10));
     }
-    log('=== Concluído ===');
+
+    novos.sort((a,b) => parseInt(a.id,10) - parseInt(b.id,10));
+    alterados.sort((a,b) => parseInt(a.item.id,10) - parseInt(b.item.id,10));
+
+    log(`${label} — novos: ${novos.length} | alterados: ${alterados.length} | maxId: ${maxId}`);
+
+    for (const it of novos) {
+        await sendToAll(formatNew(it));
+        log(`${label} → novo #${it.id}`);
+    }
+    for (const { item, anterior } of alterados) {
+        await sendToAll(formatChanged(item, anterior));
+        log(`${label} → alteração #${item.id} (${anterior} → ${item.status})`);
+    }
+
+    saveState(stateFile, {
+        lastId: Math.max(state.lastId, maxId),
+        statuses: buildStatuses(items),
+    });
+
+    log(`=== ${label} concluído ===`);
 }
 
-// ================== UPDATE STATUS (Puppeteer resolve o anti-bot) ==================
-async function atualizarStatus(id, status) {
-    const url = `${API_UPDATE_BASE}?api_key=${API_KEY}&id=${id}&status=${status}&origem=bot`;
-    log(`Atualizando #${id} → ${status}`);
-    try {
-        // Usa a MESMA função que lista pedidos — ela já resolve o AES
-        const j = await fetchWithPuppeteer(url);
-        log('API update: ' + JSON.stringify(j).substring(0, 200));
-        return j;
-    } catch (e) {
-        log('Erro update: ' + e.message);
-        return { success: false, error: { message: e.message } };
+async function verificarPedidos() {
+    return verificarLista({
+        label: 'RECARGAS',
+        url: API_URL,
+        stateFile: STATE_FILE,
+        formatNew: formatOrderNew,
+        formatChanged: formatOrderChanged,
+    });
+}
+
+async function verificarPasses() {
+    return verificarLista({
+        label: 'PASSES FF',
+        url: API_PASSES_URL,
+        stateFile: STATE_FILE_PASSES,
+        formatNew: formatPasseNew,
+        formatChanged: formatPasseChanged,
+    });
+}
+
+// ================== VERIFICAÇÃO DEPÓSITOS (lógica própria) ==================
+// Regras:
+//  - Novo pagamento JÁ approved  → notifica "Novo Depósito"
+//  - Pagamento existente que VIROU approved → notifica "Depósito Aprovado"
+//  - Outros status (pending, rejected, etc.) apenas guarda no state (sem notificar)
+async function verificarDepositos() {
+    log('=== Verificando DEPÓSITOS ===');
+    if (!BOT_TOKEN)            { log('ERRO: BOT_TOKEN ausente'); return; }
+    if (CHAT_IDS.length === 0) { log('ERRO: CHAT_IDS ausente'); return; }
+
+    let json;
+    try { json = await fetchWithPuppeteer(API_PAGAMENTOS_URL); }
+    catch (e) { log('ERRO fetch pagamentos: ' + e.message); return; }
+
+    if (!json.success || !Array.isArray(json.data)) {
+        log('ERRO resposta pagamentos: ' + JSON.stringify(json).substring(0,200));
+        return;
     }
+    const pagamentos = json.data;
+    if (pagamentos.length === 0) { log('API pagamentos vazia'); return; }
+
+    const maxId = Math.max(...pagamentos.map(p => parseInt(p.id, 10)));
+
+    const state = loadState(STATE_FILE_PAGAMENTOS);
+    if (!state) {
+        saveState(STATE_FILE_PAGAMENTOS, {
+            lastId: maxId,
+            statuses: buildStatuses(pagamentos, 'mp_status'),
+        });
+        log(`Pagamentos — primeira execução: maxId=${maxId} salvo. Não notifica.`);
+        return;
+    }
+
+    const novosAprovados = [];
+    const aprovadosAgora = [];
+
+    for (const p of pagamentos) {
+        const id           = parseInt(p.id, 10);
+        const statusAtual  = p.mp_status;
+        const statusAntigo = state.statuses[id];
+
+        if (id > state.lastId) {
+            // Novo registro — só notifica se já nasceu approved
+            if (statusAtual === STATUS_DEPOSITO_OK) novosAprovados.push(p);
+        } else if (statusAntigo && statusAntigo !== statusAtual) {
+            // Mudou de status — só notifica se virou approved
+            if (statusAtual === STATUS_DEPOSITO_OK) aprovadosAgora.push({ item: p, anterior: statusAntigo });
+        }
+    }
+
+    novosAprovados.sort((a,b) => parseInt(a.id,10) - parseInt(b.id,10));
+    aprovadosAgora.sort((a,b) => parseInt(a.item.id,10) - parseInt(b.item.id,10));
+
+    log(`Pagamentos — novos aprovados: ${novosAprovados.length} | aprovados agora: ${aprovadosAgora.length} | maxId: ${maxId}`);
+
+    for (const p of novosAprovados) {
+        await sendToAll(formatDeposito(p, null));
+        log(`DEPÓSITOS → novo #${p.id} (R$ ${fmtMoeda(p.valor)})`);
+    }
+    for (const { item, anterior } of aprovadosAgora) {
+        await sendToAll(formatDeposito(item, anterior));
+        log(`DEPÓSITOS → #${item.id} aprovado (${anterior} → approved, R$ ${fmtMoeda(item.valor)})`);
+    }
+
+    saveState(STATE_FILE_PAGAMENTOS, {
+        lastId: Math.max(state.lastId, maxId),
+        statuses: buildStatuses(pagamentos, 'mp_status'),
+    });
+
+    log('=== DEPÓSITOS concluído ===');
 }
 
 // ================== WEBHOOK ==================
 app.post('/webhook', async (req, res) => {
     const secret = req.headers['x-telegram-bot-api-secret-token'];
-    if (WEBHOOK_SECRET && secret !== WEBHOOK_SECRET) {
-        return res.status(403).send('Forbidden');
-    }
-    res.send('OK');   // responde rápido; processa depois
+    if (WEBHOOK_SECRET && secret !== WEBHOOK_SECRET) return res.status(403).send('Forbidden');
+    res.send('OK');
 
     const upd = req.body;
     if (!upd) return;
 
-    // Mensagem de texto normal (para /start, /chatid)
     if (upd.message) {
         const chatId = upd.message.chat?.id;
         const text   = upd.message.text || '';
         if (text.startsWith('/start')) {
-            await tg('sendMessage', { chat_id: chatId, text: '🤖 Bot RecargaPro ativo!\nVocê receberá notificações de novos pedidos aqui.' });
+            await tg('sendMessage', {
+                chat_id: chatId,
+                text: '🤖 Bot RecargaPro ativo!\nVocê receberá notificações de novos pedidos, passes FF e depósitos aprovados.',
+            });
         } else if (text.startsWith('/chatid')) {
             await tg('sendMessage', { chat_id: chatId, text: `Seu Chat ID: <code>${chatId}</code>`, parse_mode: 'HTML' });
         }
         return;
     }
 
-    // Clique em botão inline
     if (upd.callback_query) {
         const cq = upd.callback_query;
-        const data = cq.data || '';
-        const m = data.match(/^st:(\d+):([a-z]+)$/);
-        if (!m) return;
-
-        const orderId    = parseInt(m[1], 10);
-        const novoStatus = m[2];
-        const chatId     = cq.message.chat.id;
-        const msgId      = cq.message.message_id;
-        const original   = cq.message.text || '';
-
-        // Responde "carregando" ao Telegram (obrigatório em 3s)
-        await tg('answerCallbackQuery', {
-            callback_query_id: cq.id,
-            text: `Atualizando #${orderId} para ${cap(novoStatus)}...`,
-        });
-
-        // Chama a API PHP
-        const resultado = await atualizarStatus(orderId, novoStatus);
-
-        if (!resultado.success) {
-            await tg('sendMessage', {
-                chat_id: chatId,
-                text: `❌ Erro ao atualizar #${orderId}: ${resultado.error?.message || 'desconhecido'}`,
+        try {
+            await tg('answerCallbackQuery', {
+                callback_query_id: cq.id,
+                text: '⚠️ Botões desativados. Atualize o status pelo painel admin.',
+                show_alert: true,
             });
-            return;
-        }
-
-        // Atualiza emoji do título da mensagem original
-        const emojiNovo = { pendente:'⏳', andamento:'🔄', feita:'✅', cancelada:'❌', expirada:'⌛' }[novoStatus] || '📦';
-        let novoTexto = original
-            .replace(/^[⏳🔄✅❌⌛📦]\s*/, emojiNovo + ' ')
-            .replace(/(📊 <b>Status:<\/b>\s*)\w+/i, `$1${cap(novoStatus)}`);
-
-        // Adiciona rodapé com quem mudou e quando
-        const hora = new Date().toLocaleString('pt-BR', { timeZone: 'America/Fortaleza' });
-        const rodape = `\n\n✔️ Alterado para <b>${cap(novoStatus).toUpperCase()}</b> por você às ${hora}`;
-
-        // Se já tem rodapé anterior, remove antes de adicionar (permite mudar várias vezes)
-        novoTexto = novoTexto.replace(/\n\n✔️ Alterado para [^\n]*/g, '');
-        novoTexto += rodape;
-
-        // Edita a mensagem (remove botões após o clique — limita a uma ação por vez)
-        await tg('editMessageText', {
-            chat_id: chatId,
-            message_id: msgId,
-            text: novoTexto,
-            parse_mode: 'HTML',
-            disable_web_page_preview: true,
-            reply_markup: inlineKeyboard(orderId, novoStatus),
-        });
-
-        // Envia confirmação no chat
-        const extra = resultado.mudou_saldo && resultado.mudou_saldo !== 'nenhum'
-            ? ` Saldo ${resultado.mudou_saldo === 'devolvido' ? 'devolvido' : 'cobrado'}: R$ ${Number(resultado.status_anterior==='feita'?0:0).toFixed(2)}.`
-            : '';
-        const emailMsg = resultado.email_enviado ? ' ✉️ E-mail enviado ao cliente.' : '';
-        await tg('sendMessage', {
-            chat_id: chatId,
-            text: `✅ Pedido <b>#${orderId}</b> → <b>${cap(novoStatus).toUpperCase()}</b>.${emailMsg}${extra}`,
-            parse_mode: 'HTML',
-        });
+            await tg('editMessageReplyMarkup', {
+                chat_id: cq.message.chat.id,
+                message_id: cq.message.message_id,
+                reply_markup: { inline_keyboard: [] },
+            });
+        } catch(e){ log('Erro callback: ' + e.message); }
     }
 });
 
-// Configurar webhook
+// ================== WEBHOOK ADMIN ==================
 app.get('/setwebhook', async (req, res) => {
     const secret = req.query.secret;
     if (CRON_SECRET && secret !== CRON_SECRET) return res.status(403).send('Forbidden');
@@ -306,12 +408,22 @@ app.get('/delwebhook', async (req, res) => {
     res.json(await r.json());
 });
 
-// ================== ROTAS ANTIGAS ==================
+// ================== ROTAS ==================
 const checkHandler = async (req, res) => {
     const secret = req.query.secret || req.headers['x-cron-secret'];
     if (CRON_SECRET && secret !== CRON_SECRET) return res.status(403).send('Forbidden');
-    try { await verificarPedidos(); res.send('OK'); }
-    catch(e){ log('ERRO geral: '+e.message); res.status(500).send('Erro: '+e.message); }
+
+    // Cada check protegido individualmente — uma falha não derruba os outros
+    try { await verificarPedidos(); }
+    catch(e){ log('Erro verificarPedidos: ' + e.message); }
+
+    try { await verificarPasses(); }
+    catch(e){ log('Erro verificarPasses: ' + e.message); }
+
+    try { await verificarDepositos(); }
+    catch(e){ log('Erro verificarDepositos: ' + e.message); }
+
+    res.send('OK');
 };
 
 app.get('/',                 (req,res)=>res.send('Bot RecargaPro — Online'));
