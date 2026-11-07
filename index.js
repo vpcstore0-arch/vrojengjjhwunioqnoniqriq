@@ -7,25 +7,35 @@ app.use(express.json());
 
 // ================== CONFIG ==================
 const BOT_TOKEN      = process.env.BOT_TOKEN    || '';
-const CHAT_IDS       = (process.env.CHAT_IDS    || '').split(',').map(s => s.trim()).filter(Boolean);
+
+// Dedupe automático — evita mandar 2× se o mesmo chat estiver repetido
+const CHAT_IDS = [...new Set(
+    (process.env.CHAT_IDS || '')
+        .split(',')
+        .map(s => s.trim())
+        .filter(Boolean)
+)];
+
 const CRON_SECRET    = process.env.CRON_SECRET  || '';
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || 'whk_recarga_2026';
 
 const API_KEY = '87443981';
 
-const API_URL           = `https://recargapro.gt.tc/api_recargas_x7k2.php?api_key=${API_KEY}&limit=200&order=desc`;
-const API_PASSES_URL    = `https://recargapro.gt.tc/api_passes_x7k2.php?api_key=${API_KEY}&limit=200&order=desc`;
+const API_URL            = `https://recargapro.gt.tc/api_recargas_x7k2.php?api_key=${API_KEY}&limit=200&order=desc`;
+const API_PASSES_URL     = `https://recargapro.gt.tc/api_passes_x7k2.php?api_key=${API_KEY}&limit=200&order=desc`;
 const API_PAGAMENTOS_URL = `https://recargapro.gt.tc/api_pagamentos_x7k2.php?api_key=${API_KEY}&limit=200&order=desc`;
 
-// Status que valem notificação imediata (recargas/passes novos)
-const STATUS_OK = ['pendente', 'andamento', 'feita'];
-
-// Status de pagamento que representa "depósito confirmado"
+const STATUS_OK          = ['pendente', 'andamento', 'feita'];
 const STATUS_DEPOSITO_OK = 'approved';
 
 const STATE_FILE            = '/tmp/bot_state.txt';
 const STATE_FILE_PASSES     = '/tmp/bot_state_passes.txt';
 const STATE_FILE_PAGAMENTOS = '/tmp/bot_state_pagamentos.txt';
+
+// ================== GUARD CONTRA EXECUÇÃO DUPLICADA ==================
+let   __checkRunning   = false;
+let   __lastRunAt      = 0;
+const MIN_RUN_INTERVAL = 20000; // 20s — cobre o tempo do Puppeteer + folga
 
 // ================== LOG ==================
 function log(msg) { console.log(`[${new Date().toISOString()}] ${msg}`); }
@@ -51,9 +61,7 @@ function fmtData(dtStr) {
         return new Date(dt.getTime()+4*3600*1000).toLocaleString('pt-BR',{timeZone:'America/Fortaleza'});
     } catch(e){ return '—'; }
 }
-function fmtMoeda(v) {
-    return Number(v||0).toFixed(2).replace('.', ',');
-}
+function fmtMoeda(v) { return Number(v||0).toFixed(2).replace('.', ','); }
 
 // ================== PUPPETEER ==================
 async function fetchWithPuppeteer(url) {
@@ -161,7 +169,6 @@ function formatDeposito(p, anterior) {
     const titulo = novo
         ? `💰 <b>Novo Depósito #${p.id}</b>`
         : `💰 <b>Depósito Aprovado #${p.id}</b>`;
-
     const statusLine = novo
         ? `📊 <b>Status:</b> <b>Approved</b>`
         : `📊 <b>Status:</b> ${cap(anterior)} → <b>Approved</b>`;
@@ -176,7 +183,6 @@ function formatDeposito(p, anterior) {
 }
 
 // ================== STATE ==================
-// Formato: { lastId: número, statuses: { "123": "pendente", "124": "feita" } }
 function loadState(file) {
     try {
         if (!fs.existsSync(file)) return null;
@@ -189,8 +195,17 @@ function loadState(file) {
     return null;
 }
 
+// Atomic write — evita JSON corrompido se 2 processos escreverem ao mesmo tempo
 function saveState(file, state) {
-    try { fs.writeFileSync(file, JSON.stringify(state)); } catch(e){ log('Erro save state '+file+': '+e.message); }
+    try {
+        const tmp = file + '.tmp';
+        fs.writeFileSync(tmp, JSON.stringify(state));
+        fs.renameSync(tmp, file);
+        return true;
+    } catch(e){
+        log('Erro save state '+file+': '+e.message);
+        return false;
+    }
 }
 
 function buildStatuses(items, statusField) {
@@ -242,19 +257,25 @@ async function verificarLista({ label, url, stateFile, formatNew, formatChanged 
 
     log(`${label} — novos: ${novos.length} | alterados: ${alterados.length} | maxId: ${maxId}`);
 
-    for (const it of novos) {
-        await sendToAll(formatNew(it));
-        log(`${label} → novo #${it.id}`);
-    }
-    for (const { item, anterior } of alterados) {
-        await sendToAll(formatChanged(item, anterior));
-        log(`${label} → alteração #${item.id} (${anterior} → ${item.status})`);
-    }
-
-    saveState(stateFile, {
+    // ✅ SALVA ANTES DE ENVIAR — evita duplicar se crashar no meio do envio
+    const okSave = saveState(stateFile, {
         lastId: Math.max(state.lastId, maxId),
         statuses: buildStatuses(items),
     });
+    if (!okSave) {
+        log(`${label} — ABORTANDO envio: falha ao salvar state (evita duplicata na próxima)`);
+        return;
+    }
+
+    // Agora sim envia. Se um envio falhar, loga e segue — não reenvia na próxima.
+    for (const it of novos) {
+        const sent = await sendToAll(formatNew(it));
+        log(`${label} → novo #${it.id} ${sent ? '✓' : '⚠️ falha parcial'}`);
+    }
+    for (const { item, anterior } of alterados) {
+        const sent = await sendToAll(formatChanged(item, anterior));
+        log(`${label} → alteração #${item.id} (${anterior} → ${item.status}) ${sent ? '✓' : '⚠️ falha parcial'}`);
+    }
 
     log(`=== ${label} concluído ===`);
 }
@@ -279,11 +300,7 @@ async function verificarPasses() {
     });
 }
 
-// ================== VERIFICAÇÃO DEPÓSITOS (lógica própria) ==================
-// Regras:
-//  - Novo pagamento JÁ approved  → notifica "Novo Depósito"
-//  - Pagamento existente que VIROU approved → notifica "Depósito Aprovado"
-//  - Outros status (pending, rejected, etc.) apenas guarda no state (sem notificar)
+// ================== VERIFICAÇÃO DEPÓSITOS ==================
 async function verificarDepositos() {
     log('=== Verificando DEPÓSITOS ===');
     if (!BOT_TOKEN)            { log('ERRO: BOT_TOKEN ausente'); return; }
@@ -321,10 +338,8 @@ async function verificarDepositos() {
         const statusAntigo = state.statuses[id];
 
         if (id > state.lastId) {
-            // Novo registro — só notifica se já nasceu approved
             if (statusAtual === STATUS_DEPOSITO_OK) novosAprovados.push(p);
         } else if (statusAntigo && statusAntigo !== statusAtual) {
-            // Mudou de status — só notifica se virou approved
             if (statusAtual === STATUS_DEPOSITO_OK) aprovadosAgora.push({ item: p, anterior: statusAntigo });
         }
     }
@@ -334,21 +349,61 @@ async function verificarDepositos() {
 
     log(`Pagamentos — novos aprovados: ${novosAprovados.length} | aprovados agora: ${aprovadosAgora.length} | maxId: ${maxId}`);
 
-    for (const p of novosAprovados) {
-        await sendToAll(formatDeposito(p, null));
-        log(`DEPÓSITOS → novo #${p.id} (R$ ${fmtMoeda(p.valor)})`);
-    }
-    for (const { item, anterior } of aprovadosAgora) {
-        await sendToAll(formatDeposito(item, anterior));
-        log(`DEPÓSITOS → #${item.id} aprovado (${anterior} → approved, R$ ${fmtMoeda(item.valor)})`);
-    }
-
-    saveState(STATE_FILE_PAGAMENTOS, {
+    // ✅ SALVA ANTES DE ENVIAR
+    const okSave = saveState(STATE_FILE_PAGAMENTOS, {
         lastId: Math.max(state.lastId, maxId),
         statuses: buildStatuses(pagamentos, 'mp_status'),
     });
+    if (!okSave) {
+        log('Pagamentos — ABORTANDO envio: falha ao salvar state');
+        return;
+    }
+
+    for (const p of novosAprovados) {
+        const sent = await sendToAll(formatDeposito(p, null));
+        log(`DEPÓSITOS → novo #${p.id} (R$ ${fmtMoeda(p.valor)}) ${sent ? '✓' : '⚠️ falha parcial'}`);
+    }
+    for (const { item, anterior } of aprovadosAgora) {
+        const sent = await sendToAll(formatDeposito(item, anterior));
+        log(`DEPÓSITOS → #${item.id} (${anterior} → approved, R$ ${fmtMoeda(item.valor)}) ${sent ? '✓' : '⚠️ falha parcial'}`);
+    }
 
     log('=== DEPÓSITOS concluído ===');
+}
+
+// ================== EXECUTOR COM MUTEX + COOLDOWN ==================
+async function runAllChecks() {
+    // 1) Já está rodando? Recusa imediatamente (evita sobreposição)
+    if (__checkRunning) {
+        log('⚠️ Check já em execução — chamada ignorada (evita duplicata)');
+        return { ok: false, reason: 'busy' };
+    }
+
+    // 2) Cooldown — se rodou há menos de 20s, ignora (evita múltiplas fontes de cron)
+    const now = Date.now();
+    const sinceLast = now - __lastRunAt;
+    if (__lastRunAt > 0 && sinceLast < MIN_RUN_INTERVAL) {
+        log(`⚠️ Check rodou há ${Math.round(sinceLast/1000)}s — cooldown (${MIN_RUN_INTERVAL/1000}s). Ignorado.`);
+        return { ok: false, reason: 'cooldown' };
+    }
+
+    __checkRunning = true;
+    __lastRunAt    = now;
+
+    try {
+        try { await verificarPedidos(); }
+        catch(e){ log('Erro verificarPedidos: ' + e.message); }
+
+        try { await verificarPasses(); }
+        catch(e){ log('Erro verificarPasses: ' + e.message); }
+
+        try { await verificarDepositos(); }
+        catch(e){ log('Erro verificarDepositos: ' + e.message); }
+
+        return { ok: true };
+    } finally {
+        __checkRunning = false;
+    }
 }
 
 // ================== WEBHOOK ==================
@@ -413,23 +468,21 @@ const checkHandler = async (req, res) => {
     const secret = req.query.secret || req.headers['x-cron-secret'];
     if (CRON_SECRET && secret !== CRON_SECRET) return res.status(403).send('Forbidden');
 
-    // Cada check protegido individualmente — uma falha não derruba os outros
-    try { await verificarPedidos(); }
-    catch(e){ log('Erro verificarPedidos: ' + e.message); }
-
-    try { await verificarPasses(); }
-    catch(e){ log('Erro verificarPasses: ' + e.message); }
-
-    try { await verificarDepositos(); }
-    catch(e){ log('Erro verificarDepositos: ' + e.message); }
-
-    res.send('OK');
+    const r = await runAllChecks();
+    if (r.ok) res.send('OK');
+    else      res.status(202).send(r.reason || 'ignored'); // 202 = recebido mas não processado
 };
 
 app.get('/',                 (req,res)=>res.send('Bot RecargaPro — Online'));
 app.get('/health',           (req,res)=>res.send('OK'));
 app.get('/ping',             checkHandler);
-app.get('/bot_telegram.php', checkHandler);
+app.get('/bot_telegram.php', checkHandler); // mantido — mas agora protegido pelo mesmo mutex
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => log(`Servidor rodando na porta ${PORT}`));
+app.listen(PORT, () => {
+    log(`Servidor rodando na porta ${PORT}`);
+    if (!CRON_SECRET)    log('⚠️ AVISO: CRON_SECRET vazio — /ping acessível a qualquer um. Defina a variável!');
+    if (!BOT_TOKEN)      log('⚠️ AVISO: BOT_TOKEN vazio — notificações não serão enviadas.');
+    if (!CHAT_IDS.length) log('⚠️ AVISO: CHAT_IDS vazio — sem destinatários.');
+    log(`Chat IDs únicos: ${CHAT_IDS.join(', ') || '(nenhum)'}`);
+});
